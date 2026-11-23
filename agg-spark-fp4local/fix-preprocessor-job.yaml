@@ -1,0 +1,44 @@
+# One-shot: add image preprocessor configs from Qwen base into the Inferact NVFP4 snapshot on ff3.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fix-inferact-preprocessor
+  namespace: dynamo-qwen
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: gx10-1ff3
+      restartPolicy: Never
+      containers:
+        - name: fix
+          image: python:3.12-slim
+          envFrom:
+            - secretRef:
+                name: hf-token-secret
+          env:
+            - name: HF_HOME
+              value: /model-cache
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              pip install --no-cache-dir 'huggingface_hub>=0.26'
+              SNAP=/model-cache/hub/models--Inferact--Qwen3.8-Flash-Next-NVFP4/snapshots/103a7608316173ca6edd49929544244de7ffda70
+              test -d "$SNAP"
+              hf download Qwen/Qwen3.8-Flash-Next \
+                preprocessor_config.json \
+                processor_config.json \
+                --local-dir "$SNAP"
+              ls -la "$SNAP" | egrep 'preprocessor|processor_config' || true
+              test -f "$SNAP/preprocessor_config.json"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /model-cache
+      volumes:
+        - name: model-cache
+          hostPath:
+            path: /home/dav1/.cache/huggingface
+            type: Directory

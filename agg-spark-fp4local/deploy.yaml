@@ -1,0 +1,104 @@
+# Spark (2x GB10) smoke DGD — small model without PLE/NVFP4 host-RAM pressure.
+# Weights: Qwen/Qwen3-0.6B in ff3 hostPath HF cache.
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen38fn-agg-spark-fp4
+  namespace: dynamo-qwen
+spec:
+  backendFramework: vllm
+  env:
+    - name: HF_HOME
+      value: /model-cache
+    - name: HF_HUB_OFFLINE
+      value: "1"
+    - name: TRANSFORMERS_OFFLINE
+      value: "1"
+    - name: VLLM_WORKER_MULTIPROC_METHOD
+      value: spawn
+    - name: PYTHONUNBUFFERED
+      value: "1"
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      runtimeVersionOverride: "1.6.0"
+      podTemplate:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: gx10-1be4
+          containers:
+            - name: main
+              image: vllm/vllm-openai:qwen38-flash-next
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  if ! python3 -c "import dynamo.frontend" 2>/dev/null; then
+                    pip install --no-cache-dir --no-deps 'ai-dynamo==1.6.0' 'ai-dynamo-runtime==1.6.0'
+                    pip install --no-cache-dir 'protobuf>=6.30.2,<7' 'kubernetes>=32,<33' 'transformers>=4.56'
+                  fi
+                  exec python3 -m dynamo.frontend --http-host 0.0.0.0 --http-port 8000
+              ports:
+                - containerPort: 8000
+    - name: worker
+      type: worker
+      replicas: 1
+      runtimeVersionOverride: "1.6.0"
+      sharedMemorySize: 4Gi
+      podTemplate:
+        spec:
+          nodeSelector:
+            kubernetes.io/hostname: gx10-1ff3
+          containers:
+            - name: main
+              image: vllm/vllm-openai:qwen38-flash-next
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  if ! python3 -c "import dynamo.vllm" 2>/dev/null; then
+                    pip install --no-cache-dir --no-deps 'ai-dynamo==1.6.0' 'ai-dynamo-runtime==1.6.0'
+                    pip install --no-cache-dir 'protobuf>=6.30.2,<7' 'kubernetes>=32,<33' 'transformers>=4.56'
+                  fi
+                  python3 - <<'SHIM'
+                  import vllm.v1.engine.utils as eu
+                  if not hasattr(eu, "get_engine_zmq_addresses"):
+                      eu.get_engine_zmq_addresses = eu.get_engine_zmq_bind_addresses
+                  SHIM
+                  exec python3 -m dynamo.vllm \
+                    --model Qwen/Qwen3-0.6B \
+                    --served-model-name Qwen/Qwen3-0.6B \
+                    --trust-remote-code \
+                    --tensor-parallel-size 1 \
+                    --max-model-len 8192 \
+                    --max-num-seqs 32 \
+                    --gpu-memory-utilization 0.85 \
+                    --enable-prefix-caching
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: model-cache, mountPath: /model-cache, readOnly: true }
+                - { name: dshm, mountPath: /dev/shm }
+              startupProbe:
+                httpGet:
+                  path: /live
+                  port: 9090
+                periodSeconds: 15
+                timeoutSeconds: 5
+                failureThreshold: 40
+          volumes:
+            - name: model-cache
+              hostPath:
+                path: /home/dav1/.cache/huggingface
+                type: Directory
+            - name: dshm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 4Gi
